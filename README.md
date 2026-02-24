@@ -1,68 +1,96 @@
+}
 #ZLK
-My crypto coin 
-Supporting the TON eco-system
-EQDnyVY_XdTtjg1cr6z_nf7f1gyL5niPlEyOPriHzSuX1Ctn
-ZLK
-9950000000
-() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
-    throw_if(error::empty_not_allowed, in_msg_body.slice_empty?());
-    ctx::init(my_balance, msg_value, in_msg_full, in_msg_body);
+;; STON.fi LP Jetton Minter
+#include "stdlib.fc";
 
-    ;; 1bounced message
-    if ctx.at(IS_BOUNCED) { 
+global int total_supply;
+global slice UQCO0tSfrvUCnAKGZQJ9v00V2R3RBzaaypXF9wlcRTfnJrG9
+global cell jetton_content;
+global cell jetton_wallet_code;
+
+() load_data() impure {
+    var ds = get_data().begin_parse();
+    total_supply = ds~load_coins();
+    admin_address = ds~load_msg_addr();
+    jetton_content = ds~load_ref();
+    jetton_wallet_code = ds~load_ref();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_coins(total_supply)
+        .store_slice(admin_address)
+        .store_ref(jetton_content)
+        .store_ref(jetton_wallet_code)
+        .end_cell());
+}
+
+slice calculate_user_wallet_address(slice owner_address) inline {
+    return begin_cell()
+        .store_uint(0, 2)
+        .store_slice(owner_address)
+        .store_uint(0, 1)
+        .store_ref(jetton_wallet_code)
+        .end_cell()
+        .begin_parse();
+}
+
+() mint(slice to, int amount) impure {
+    total_supply += amount;
+    var wallet = calculate_user_wallet_address(to);
+
+    send_raw_message(begin_cell()
+        .store_uint(0x178d4519, 32)
+        .store_slice(wallet)
+        .store_coins(amount)
+        .end_cell(), 64);
+}
+
+() burn(slice from, int amount) impure {
+    total_supply -= amount;
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    load_data();
+
+    if (in_msg_body.slice_empty?()) {
         return ();
     }
 
-    ;; workchain
-    throw_unless(error::wrong_workchain, ctx.at(SENDER).address::check_workchain(params::workchain))
-    storage::load();
+    var op = in_msg_body~load_uint(32);
 
-    ;; token0 token 
-    throw_if(error::invalid_token, equal_slices(storage::token0_address, storage::token1_address));
+    ;; mint by router
+    if (op == 0x178d4519) {
+        var sender = get_msg_sender();
+        throw_unless(100, equal_slices(sender, admin_address));
 
-    let token_address = ctx.at(TOKEN);  
-    if ! (equal_slices(token_address, storage::token0_address) || equal_slices(token_address, storage::token1_address))  
-        log("Invalid token received, sending refund with reason")
-        let msg = builder().store_uint(0xDEAD, 32) ;; 
-                        .store_string("Invalid token")
-                        .end_cell();
+        var to = in_msg_body~load_msg_addr();
+        var amount = in_msg_body~load_coins();
 
-        ctx::send_message(ctx.at(SENDER), msg_value, msg);
-
-        ;;  refund 
-        ctx::send_refund(ctx.at(SENDER), msg_value);
-
-        ;; throw
+        mint(to, amount);
+        save_data();
         return ();
     }
 
-    ;; --- collect_fees ---
-    if equal_slices(ctx.at(SENDER), storage::protocol_fee_address) {
-        handle_protocolfee_messages();
+    ;; burn notification
+    if (op == 0x595f07bc) {
+        var amount = in_msg_body~load_coins();
+        burn(get_msg_sender(), amount);
+        save_data();
         return ();
     }
 
-    ;; --- swap, provide_lp та governance повідомлень ---
-    if equal_slices(ctx.at(SENDER), storage::router_address) {
-        handle_router_messages();
+    ;; get_jetton_data
+    if (op == 0x2fcb26a2) {
+        var b = begin_cell()
+            .store_coins(total_supply)
+            .store_slice(admin_address)
+            .store_ref(jetton_content)
+            .store_ref(jetton_wallet_code)
+            .end_cell();
+        send_raw_message(b, 64);
         return ();
     }
 
-    ;; -- LP wallet messages ---
-    if handle_lp_wallet_messages() {
-        return ();
-    }
-
-    ;; --- LP account messages ---
-    if handle_lp_account_messages() {
-        return ();
-    }
-
-    ;; --- getter повідомлень ---
-    if handle_getter_messages() {
-        return (); 
-    }
-
-    
-    ;; throw(error::wrong_op);
+    throw(0xffff);
 }
