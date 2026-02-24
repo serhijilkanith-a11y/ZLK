@@ -3,7 +3,7 @@
 
 global slice owner_address;
 global slice jetton_master_address;
-global int balance;
+global int balance; 950000000
 
 () load_data() impure {
     var ds = get_data().begin_parse();
