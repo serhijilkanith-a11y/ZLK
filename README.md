@@ -1,9 +1,11 @@
-;; ZLK Jetton Wallet (TEP-74)
+;; ZLK Jetton Wallet (TEP-74 compliant)
 #include "stdlib.fc";
 
 global slice owner_address;
 global slice jetton_master_address;
-global int balance; 950000000
+global int balance;
+
+;; ================= DATA =================
 
 () load_data() impure {
     var ds = get_data().begin_parse();
@@ -20,15 +22,30 @@ global int balance; 950000000
     set_data(b.end_cell());
 }
 
+;; =============== UTILS ==================
+
+() send_msg(slice to, int value, int mode, cell body) impure inline {
+    var msg = begin_cell()
+        .store_uint(0x18, 6) ;; int msg
+        .store_slice(to)
+        .store_coins(value)
+        .store_uint(0, 1)
+        .store_ref(body)
+        .end_cell();
+    send_raw_message(msg, mode);
+}
+
+;; ============== TRANSFER ===============
+
 () send_tokens(slice to, int amount, slice response, int fwd_ton, cell fwd_payload) impure {
     throw_unless(705, equal_slices(sender_address(), owner_address));
     throw_unless(706, balance >= amount);
 
     balance -= amount;
 
-    var msg_body = begin_cell()
+    var body = begin_cell()
         .store_uint(0xf8a7ea5, 32) ;; transfer
-        .store_uint(0, 64)
+        .store_uint(0, 64) ;; query_id
         .store_coins(amount)
         .store_slice(owner_address)
         .store_slice(response)
@@ -37,125 +54,96 @@ global int balance; 950000000
         .store_ref(fwd_payload)
         .end_cell();
 
-    send_raw_message(
-        begin_cell()
-            .store_uint(0x18, 6)
-            .store_slice(to)
-            .store_coins(0)
-            .store_uint(4, 4)
-            .store_ref(msg_body)
-            .end_cell(),
-        1
-    );
-
+    send_msg(to, 0, 1, body);
     save_data();
 }
 
-() receive_tokens(slice from, int amount, slice response) impure {
+;; ======== RECEIVE INTERNAL TRANSFER ========
+
+() receive_tokens(slice from, int amount, slice response, int query_id) impure {
     throw_unless(707, equal_slices(sender_address(), jetton_master_address));
 
     balance += amount;
 
     if (!response.slice_empty?()) {
-        var msg = begin_cell()
+        var notify = begin_cell()
             .store_uint(0x7362d09c, 32) ;; transfer_notification
-            .store_uint(0, 64)
+            .store_uint(query_id, 64)
             .store_coins(amount)
             .store_slice(from)
             .end_cell();
 
-        send_raw_message(
-            begin_cell()
-                .store_uint(0x10, 6)
-                .store_slice(response)
-                .store_coins(0)
-                .store_uint(0, 1)
-                .store_ref(msg)
-                .end_cell(),
-            1
-        );
+        send_msg(response, 0, 1, notify);
     }
 
     save_data();
 }
 
-() burn(int amount, slice response) impure {
-    throw_unless(705, equal_slices(sender_address(), owner_address));
-    throw_unless(706, balance >= amount);
+;; ================= BURN =================
+
+() burn(int amount, slice response, int query_id) impure {
+    throw_unless(708, equal_slices(sender_address(), owner_address));
+    throw_unless(709, balance >= amount);
 
     balance -= amount;
 
-    var msg = begin_cell()
-        .store_uint(0x7bdd97de, 32) ;; burn_notification
-        .store_uint(0, 64)
+    var body = begin_cell()
+        .store_uint(0x595f07bc, 32) ;; burn
+        .store_uint(query_id, 64)
         .store_coins(amount)
         .store_slice(owner_address)
         .store_slice(response)
         .end_cell();
 
-    send_raw_message(
-        begin_cell()
-            .store_uint(0x18, 6)
-            .store_slice(jetton_master_address)
-            .store_coins(0)
-            .store_uint(4, 4)
-            .store_ref(msg)
-            .end_cell(),
-        1
-    );
-
+    send_msg(jetton_master_address, 0, 1, body);
     save_data();
 }
 
-() recv_internal(int balance_ton, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+;; ============= INTERNAL HANDLER =============
+
+() recv_internal(int msg_value, cell in_msg, slice in_body) impure {
     load_data();
 
-    if (in_msg_body.slice_empty?()) {
+    if (in_body.slice_empty?()) {
         return ();
     }
 
-    var sender = in_msg_full.begin_parse()~load_msg_addr();
-    var op = in_msg_body~load_uint(32);
+    var op = in_body~load_uint(32);
 
-    ;; transfer (від власника)
+    ;; internal_transfer
+    if (op == 0x178d4519) {
+        var query_id = in_body~load_uint(64);
+        var amount = in_body~load_coins();
+        var from = in_body~load_msg_addr();
+        var response = in_body~load_msg_addr();
+        receive_tokens(from, amount, response, query_id);
+        return ();
+    }
+
+    ;; transfer
     if (op == 0xf8a7ea5) {
-        var query_id = in_msg_body~load_uint(64);
-        var amount = in_msg_body~load_coins();
-        var to = in_msg_body~load_msg_addr();
-        var response = in_msg_body~load_msg_addr();
-        var fwd_ton = in_msg_body~load_coins();
-        var has_payload = in_msg_body~load_uint(1);
-        var payload = has_payload ? in_msg_body~load_ref() : null();
+        var query_id = in_body~load_uint(64);
+        var amount = in_body~load_coins();
+        var to = in_body~load_msg_addr();
+        var response = in_body~load_msg_addr();
+        var fwd_ton = in_body~load_coins();
+        var has_payload = in_body~load_uint(1);
+
+        cell payload = null();
+        if (has_payload == 1) {
+            payload = in_body~load_ref();
+        }
 
         send_tokens(to, amount, response, fwd_ton, payload);
         return ();
     }
 
-    ;; internal transfer (від мінтера або іншого wallet)
-    if (op == 0x178d4519) {
-        var query_id = in_msg_body~load_uint(64);
-        var amount = in_msg_body~load_coins();
-        var from = in_msg_body~load_msg_addr();
-        var response = in_msg_body~load_msg_addr();
-
-        receive_tokens(from, amount, response);
-        return ();
-    }
-
     ;; burn
     if (op == 0x595f07bc) {
-        var query_id = in_msg_body~load_uint(64);
-        var amount = in_msg_body~load_coins();
-        var response = in_msg_body~load_msg_addr();
-
-        burn(amount, response);
+        var query_id = in_body~load_uint(64);
+        var amount = in_body~load_coins();
+        var response = in_body~load_msg_addr();
+        burn(amount, response, query_id);
         return ();
     }
-
-    throw(0xffff);
-}
-
-(int, slice, slice, int) get_wallet_data() method_id {
-    load_data();
-    return (balance, owner_address, jetton_master_address, 0);
 }
